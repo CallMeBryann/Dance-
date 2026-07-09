@@ -1,0 +1,458 @@
+--SmoothDanceManager--Modul
+local SmoothDanceManager = {}
+SmoothDanceManager.__index = SmoothDanceManager
+
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local ContentProvider = game:GetService("ContentProvider")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- ✅ MENGGUNAKAN EMOTECONFIG (Menggantikan DanceConfigHelper lama)
+local EmoteConfig = require(ReplicatedStorage.SetModule.EmoteConfig)
+
+-- Helper internal untuk menggantikan fungsi DanceConfigHelper yang lama
+local function getEmoteList()
+	return EmoteConfig.dances or EmoteConfig.emotes or EmoteConfig
+end
+
+local function getAnimationIdFromConfig(nameOrId)
+	if tonumber(nameOrId) then return tonumber(nameOrId) end
+	local emoteList = getEmoteList()
+	return emoteList[nameOrId]
+end
+
+local function getAnimationNameFromId(id)
+	local emoteList = getEmoteList()
+	local numId = tonumber(id)
+	for name, val in pairs(emoteList) do
+		if tonumber(val) == numId then
+			return name
+		end
+	end
+	return tostring(id)
+end
+
+function SmoothDanceManager:_prewarmTrack(track)
+	if track then
+		local success = pcall(function()
+			track:AdjustSpeed(0.001)
+			track:Play(0.05, 0, 0.001)
+			track:AdjustWeight(0)
+			RunService.Heartbeat:Wait()
+			track:Stop(0.05)
+		end)
+		if not success then
+			warn("SmoothDanceManager: prewarm gagal (abaikan jika minor)")
+		end
+	end
+end
+
+function SmoothDanceManager.preloadPopularAnimations(manager, animationList, options)
+	local config = options or {}
+	local batchSize = config.batchSize or 8
+	local doPrewarm = config.prewarm ~= false
+	local loadToCache = config.loadToCache ~= false
+
+	if not animationList or #animationList == 0 then
+		return { ok = true, count = 0, results = {} }
+	end
+
+	local animationInstances = {}
+	for _, animId in ipairs(animationList) do
+		if animId and tostring(animId) ~= "" then
+			local animInstance = Instance.new("Animation")
+			animInstance.AnimationId = "rbxassetid://" .. tostring(animId)
+			table.insert(animationInstances, animInstance)
+		end
+	end
+
+	local startIndex = 1
+	local results = {}
+
+	while startIndex <= #animationInstances do
+		local endIndex = math.min(startIndex + batchSize - 1, #animationInstances)
+		local batch = {}
+
+		for i = startIndex, endIndex do
+			table.insert(batch, animationInstances[i])
+		end
+
+		local success, err = pcall(function()
+			ContentProvider:PreloadAsync(batch)
+		end)
+
+		if not success then
+			warn(("SmoothDanceManager: PreloadAsync batch gagal: %s"):format(tostring(err)))
+		end
+
+		startIndex = endIndex + 1
+	end
+
+	local successCount = 0
+	for _, animInstance in ipairs(animationInstances) do
+		local rawId = animInstance.AnimationId
+		local extractedId = tonumber(rawId:match("(%d+)")) or rawId
+
+		local success, result = pcall(function()
+			if not loadToCache then return true end
+			local track = manager:_getAnimationTrack(extractedId)
+			if doPrewarm and track then
+				manager:_prewarmTrack(track)
+			end
+			return track
+		end)
+
+		if success and result then
+			results[extractedId] = { ok = true, err = nil }
+			successCount = successCount + 1
+		else
+			results[extractedId] = { ok = false, err = result }
+		end
+
+		animInstance:Destroy()
+	end
+
+	return {
+		ok = successCount == #animationInstances,
+		count = successCount,
+		total = #animationInstances,
+		results = results
+	}
+end
+
+function SmoothDanceManager.new(player)
+	local self = setmetatable({}, SmoothDanceManager)
+	self.player = player
+	self.character = nil
+	self.humanoid = nil
+	self.animator = nil
+	self.currentTrack = nil
+	self.fadingTracks = {}
+	self.animationCache = {}
+
+	self.defaultFadeIn = 0.6
+	self.defaultFadeOut = 0.6
+	self.defaultSpeed = 1
+	self.fadeConnections = {}
+
+	self:_updateCharacterComponents()
+
+	if player then
+		player.CharacterAdded:Connect(function()
+			self:_updateCharacterComponents()
+			self:_clearCache()
+		end)
+	end
+
+	return self
+end
+
+function SmoothDanceManager:_updateCharacterComponents()
+	if not self.player then return false end
+
+	self.character = self.player.Character
+	if not self.character then return false end
+
+	self.humanoid = self.character:FindFirstChild("Humanoid")
+	if not self.humanoid then return false end
+
+	self.animator = self.humanoid:FindFirstChild("Animator")
+	return self.animator ~= nil
+end
+
+function SmoothDanceManager:_clearCache()
+	for _, track in pairs(self.animationCache) do
+		if track then track:Stop() end
+	end
+
+	self.animationCache = {}
+	self.currentTrack = nil
+	self.fadingTracks = {}
+
+	for _, connection in pairs(self.fadeConnections) do
+		if connection then connection:Disconnect() end
+	end
+	self.fadeConnections = {}
+end
+
+function SmoothDanceManager:_getAnimationTrack(animationIdOrName)
+	local animId = getAnimationIdFromConfig(animationIdOrName)
+
+	if not animId then
+		warn("SmoothDanceManager: Animation not found in EmoteConfig: " .. tostring(animationIdOrName))
+		return nil
+	end
+
+	local animIdStr = tostring(animId)
+	if self.animationCache[animIdStr] then
+		return self.animationCache[animIdStr]
+	end
+
+	if not self:_updateCharacterComponents() then
+		return nil
+	end
+
+	local newAnim = Instance.new("Animation")
+	newAnim.AnimationId = "rbxassetid://" .. tostring(animId)
+
+	local successLoad, trackFallback = pcall(function()
+		return self.animator:LoadAnimation(newAnim)
+	end)
+	newAnim:Destroy()
+
+	if not (successLoad and trackFallback) then
+		return nil
+	end
+
+	trackFallback.Priority = Enum.AnimationPriority.Action4
+	trackFallback.Looped = true
+	self.animationCache[animIdStr] = trackFallback
+	return trackFallback
+end
+
+function SmoothDanceManager:_fadeOutTrack(track, fadeOutTime, callback)
+	if track and track.IsPlaying then
+		local duration = fadeOutTime or self.defaultFadeOut
+		local startWeight = track.WeightCurrent
+		local startTime = tick()
+		local connection = nil
+
+		connection = RunService.Heartbeat:Connect(function()
+			local elapsed = (tick() - startTime) / duration
+			local progress = math.min(elapsed, 1)
+			local cosProgress = (1 - progress) * math.pi
+
+			track:AdjustWeight(startWeight * ((1 - math.cos(cosProgress)) * 0.5))
+
+			if progress >= 1 then
+				track:Stop()
+				if connection then connection:Disconnect() end
+				if callback then callback() end
+			end
+		end)
+
+		table.insert(self.fadeConnections, connection)
+		return connection
+	end
+
+	if callback then callback() end
+end
+
+function SmoothDanceManager:_fadeInTrack(track, fadeInTime, targetWeight, targetSpeed)
+	if track then
+		local duration = fadeInTime or self.defaultFadeIn
+		local weightTarget = targetWeight or 1
+		local speedTarget = targetSpeed or self.defaultSpeed
+
+		track:AdjustWeight(0)
+		track:Play()
+
+		if speedTarget ~= 1 then
+			track:AdjustSpeed(speedTarget)
+		end
+
+		local startTime = tick()
+		local connection = nil
+
+		connection = RunService.Heartbeat:Connect(function()
+			local elapsed = (tick() - startTime) / duration
+			local progress = math.min(elapsed, 1)
+			local cosProgress = progress * math.pi
+
+			track:AdjustWeight(weightTarget * ((1 - math.cos(cosProgress)) * 0.5))
+
+			if progress >= 1 and connection then
+				connection:Disconnect()
+			end
+		end)
+
+		table.insert(self.fadeConnections, connection)
+		return connection
+	end
+end
+
+function SmoothDanceManager:playDance(animationIdOrName, options)
+	local animOptions = options or {}
+	local fadeIn = animOptions.fadeIn or self.defaultFadeIn
+	local fadeOut = animOptions.fadeOut or self.defaultFadeOut
+	local speed = animOptions.speed or self.defaultSpeed
+	local startTime = animOptions.startTime
+	local serverTime = animOptions.serverTime
+	local normalizedTime = animOptions.normalizedTime
+
+	if not animationIdOrName or animationIdOrName == "" then
+		warn("SmoothDanceManager: Invalid animation name/ID")
+		return false
+	end
+
+	local track = self:_getAnimationTrack(animationIdOrName)
+	if not track then
+		warn("SmoothDanceManager: Failed to load animation " .. tostring(animationIdOrName))
+		return false
+	end
+
+	local danceName = getAnimationNameFromId(animationIdOrName)
+
+	if self.currentTrack == track and track.IsPlaying then
+		local speedDiff = speed - track.Speed
+		if math.abs(speedDiff) > 0.01 then
+			self:setSpeed(speed, 0.2)
+		end
+		if normalizedTime then
+			track.TimePosition = normalizedTime
+		end
+		return true
+	end
+
+	local previousTrack = self.currentTrack
+	if previousTrack and previousTrack.IsPlaying then
+		table.insert(self.fadingTracks, previousTrack)
+
+		self:_fadeOutTrack(previousTrack, fadeOut, function()
+			for i, fadingTrack in ipairs(self.fadingTracks) do
+				if fadingTrack == previousTrack then
+					table.remove(self.fadingTracks, i)
+					return
+				end
+			end
+		end)
+
+		local prevName = self:getCurrentInfo().name or "unknown"
+		print("🎵 SmoothDanceManager: Crossfading from " .. prevName .. " to " .. danceName)
+	else
+		print("🎵 SmoothDanceManager: Starting " .. danceName .. " with smooth fade-in")
+	end
+
+	self.currentTrack = track
+	self:_fadeInTrack(track, fadeIn, 1, speed)
+
+	if serverTime and normalizedTime then
+		local targetTime = (normalizedTime + (tick() - serverTime) * speed) % (track.Length or 10)
+		task.spawn(function()
+			RunService.Heartbeat:Wait()
+			if track.IsPlaying then
+				track.TimePosition = targetTime
+			end
+		end)
+	elseif startTime then
+		task.spawn(function()
+			RunService.Heartbeat:Wait()
+			if track.IsPlaying then
+				track.TimePosition = startTime
+			end
+		end)
+	end
+
+	return true
+end
+
+function SmoothDanceManager:stopDance(fadeOutTime)
+	local duration = fadeOutTime or self.defaultFadeOut
+
+	if not (self.currentTrack and self.currentTrack.IsPlaying) then
+		return false
+	end
+
+	if self._fadeOutTrack then
+		self:_fadeOutTrack(self.currentTrack, duration)
+	else
+		self.currentTrack:Stop(duration)
+	end
+
+	self.currentTrack = nil
+	print("SmoothDanceManager: Stopping dance with smooth fade out")
+
+	if _G.ForceFixAllWalkSpeeds then
+		_G.ForceFixAllWalkSpeeds()
+	end
+	return true
+end
+
+function SmoothDanceManager:stopAll()
+	if self.currentTrack then
+		self.currentTrack:Stop()
+		self.currentTrack = nil
+	end
+
+	for _, track in ipairs(self.fadingTracks) do
+		if track then track:Stop() end
+	end
+	self.fadingTracks = {}
+
+	for _, connection in pairs(self.fadeConnections) do
+		if connection then connection:Disconnect() end
+	end
+	self.fadeConnections = {}
+
+	print("🎵 SmoothDanceManager: Emergency stop all animations")
+end
+
+function SmoothDanceManager:getCurrentInfo()
+	if not (self.currentTrack and self.currentTrack.IsPlaying) then
+		return { isPlaying = false }
+	end
+
+	local animId = self.currentTrack.Animation.AnimationId:match("(%d+)")
+	local danceName = getAnimationNameFromId(animId)
+
+	return {
+		animId = animId,
+		name = danceName,
+		speed = self.currentTrack.Speed,
+		timePosition = self.currentTrack.TimePosition,
+		weight = self.currentTrack.WeightCurrent,
+		length = self.currentTrack.Length,
+		isPlaying = true
+	}
+end
+
+function SmoothDanceManager:setSpeed(targetSpeed, fadeTime)
+	if not (self.currentTrack and self.currentTrack.IsPlaying) then
+		return false
+	end
+
+	if fadeTime and fadeTime > 0 then
+		local initialSpeed = self.currentTrack.Speed
+		local startTime = tick()
+		local connection = nil
+
+		connection = RunService.Heartbeat:Connect(function()
+			local elapsed = (tick() - startTime) / fadeTime
+			local progress = math.min(elapsed, 1)
+
+			local speedDiff = targetSpeed - initialSpeed
+			local cosProgress = progress * math.pi
+			local newSpeed = initialSpeed + speedDiff * ((1 - math.cos(cosProgress)) * 0.5)
+
+			self.currentTrack:AdjustSpeed(newSpeed)
+
+			if progress >= 1 and connection then
+				connection:Disconnect()
+			end
+		end)
+
+		table.insert(self.fadeConnections, connection)
+	else
+		self.currentTrack:AdjustSpeed(targetSpeed)
+	end
+	return true
+end
+
+function SmoothDanceManager:syncAnimation(animName, speed, serverTime, currentTime)
+	local startT = ((currentTime or tick()) - serverTime) * speed % 10
+	return self:playDance(animName, {
+		speed = speed,
+		startTime = startT
+	})
+end
+
+function SmoothDanceManager:destroy()
+	self:stopAll()
+	self:_clearCache()
+	self.player = nil
+	self.character = nil
+	self.humanoid = nil
+	self.animator = nil
+end
+
+return SmoothDanceManager
