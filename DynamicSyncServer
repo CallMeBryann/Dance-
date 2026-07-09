@@ -1,0 +1,830 @@
+-- ============================================================
+-- DYNAMIC SYNC SERVER v3.5 — DRIFT TIGHTENING + LEAD COMPENSATION
+-- ============================================================
+-- Filosofi versi ini: v3 terbukti stabil di produksi, jadi v3.4
+-- adalah v3 APA ADANYA dengan tambahan minimal & terjaga:
+--
+--   [v3.4-A] INITIAL SYNC PRESISI (satu-satunya kekurangan v3):
+--     • Jalur panas: jika track sudah ter-cache (Length > 0),
+--       play + time-lock berjalan SINKRON — identik dengan v3.
+--     • Jalur dingin: hanya animasi yang belum pernah dimuat
+--       (Length = 0) menunggu asset siap sebelum di-time-lock,
+--       supaya TimePosition tidak ter-clamp ke 0 (penyebab
+--       follower mulai dari detik 0 pada sync pertama).
+--     • Thread tunggu dijaga TOKEN EPOCH: jika state follower
+--       berubah (stop / ganti dance / resync), thread lama batal
+--       otomatis — trek yatim yang tak bisa di-stop MUSTAHIL.
+--
+--   [v3.4-B] ANTI DOUBLE-ANIMATION:
+--     • getActiveDanceTracks mengabaikan trek yang sedang
+--       fade-out (WeightTarget = 0). Saat leader ganti A → B,
+--       Dance A yang sekarat tidak akan pernah disalin follower.
+--     • Stop/Play follower juga menyapu animator langsung
+--       (stopAllDanceAnimations), bukan hanya registry — jaring
+--       pengaman terhadap trek yang lolos registrasi.
+--
+-- Mesin pemulihan /re milik v3.1–v3.3 (syncWithVerify, invalidasi
+-- cache, recovery CharacterAdded) TIDAK dibawa — jalur /re kembali
+-- persis seperti v3 yang sudah Anda verifikasi stabil.
+-- API 100% kompatibel — remote, GUI, alur pemain tidak berubah.
+-- ============================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+
+-- ============================================================
+-- ⚙️ KONFIGURASI
+-- ============================================================
+local CONFIG = {
+	RATE_LIMIT_COOLDOWN = 2,     -- cooldown request sync per player (dtk)
+
+	FADE_TIME = 0.15,            -- durasi fade in/out transisi animasi
+
+	DRIFT_CHECK_INTERVAL = 0.1,  -- interval loop koreksi (dtk) — lebih sering
+	DRIFT_DEADZONE = 0.02,       -- selisih <= ini dianggap sinkron — lebih ketat
+	DRIFT_SNAP_THRESHOLD = 0.25, -- selisih >= ini → snap langsung
+	DRIFT_NUDGE_GAIN = 0.9,      -- agresivitas koreksi halus — lebih agresif
+	DRIFT_MAX_NUDGE = 0.25,      -- batas nudge kecepatan (±25%)
+
+	-- [BARU] Kompensasi lead: follower cenderung SELALU tertinggal akibat
+	-- latency replikasi (animasi diputar di server → butuh waktu sampai ke
+	-- client). Nilai ini mendorong follower sedikit ke DEPAN agar hasil
+	-- yang terlihat mata lebih sejajar dengan leader. Satuan: detik.
+	-- Naikkan bila follower masih terasa tertinggal; turunkan bila follower
+	-- justru terlihat mendahului leader. 0 = nonaktif.
+	LEAD_COMPENSATION = 0.15,
+
+	RESYNC_COOLDOWN = 1.5,       -- jeda minimal antar full-resync otomatis
+	REHOOK_DELAY = 0.05,         -- failsafe delay saat Animator baru muncul
+
+	TRACK_READY_TIMEOUT = 3,     -- [v3.4-A] batas tunggu asset animasi siap
+}
+
+-- ============================================================
+-- 📍 PATH & REMOTES (TIDAK BERUBAH — kompatibilitas penuh)
+-- ============================================================
+local setModule = ReplicatedStorage:WaitForChild("SetModule")
+local syncRemoteFolder = setModule:WaitForChild("SyncRemote")
+local remotes = setModule:WaitForChild("Remotes")
+
+local syncEvent = syncRemoteFolder:WaitForChild("Sync")
+local stopSyncEvent = syncRemoteFolder:WaitForChild("StopSync")
+local syncStatusEvent = syncRemoteFolder:WaitForChild("SyncStatus")
+local EmoteEvent = remotes:WaitForChild("EmoteEvent")
+
+local animatorRefreshed = syncRemoteFolder:FindFirstChild("AnimatorRefreshed")
+if not animatorRefreshed then
+	animatorRefreshed = Instance.new("BindableEvent")
+	animatorRefreshed.Name = "AnimatorRefreshed"
+	animatorRefreshed.Parent = syncRemoteFolder
+end
+
+local konfFolder = setModule:WaitForChild("KonfigurasiSystemSoftware")
+local connRemoteFolder = konfFolder:WaitForChild("ConnectionRemote")
+local notifRemote = connRemoteFolder:WaitForChild("NotificationRemote")
+
+local IGNORED_PRIORITIES = {
+	[Enum.AnimationPriority.Core] = true,
+	[Enum.AnimationPriority.Idle] = true,
+	[Enum.AnimationPriority.Movement] = true,
+}
+
+local IGNORED_NAMES = {
+	running = true, swimming = true, platformstanding = true, seated = true,
+	fallingdown = true, gettingup = true, jumping = true, climbing = true,
+	walking = true, idle = true, run = true, walk = true, jump = true,
+	climb = true, fall = true, swim = true,
+}
+
+-- ============================================================
+-- 📊 STATE JARINGAN & RESOURCE
+-- ============================================================
+local PlayerUsage = {}        -- [player] = tick terakhir request sync
+local ActiveSyncs = {}        -- [follower] = leader
+local FollowersList = {}      -- [leader] = { follower, ... }
+local SyncConnections = {}    -- [player] = { RBXScriptConnection, ... }
+local FollowerTracks = {}     -- [follower] = { [animId] = cachedTrack }
+local RestoredTracks = {}     -- [player] = trek titipan hasil /re (orphan)
+local ResyncCooldown = {}     -- [follower] = os.clock terakhir auto-resync
+
+-- [v3.4-A] TOKEN EPOCH per follower. Setiap perubahan state trek
+-- (sync baru, ganti dance, stop) menaikkan angka ini. Thread play
+-- yang tertunda menyimpan epoch saat dibuat dan BATAL otomatis
+-- jika epoch sudah berubah — mencegah trek yatim dari race.
+local SyncEpoch = {}
+
+local function bumpEpoch(player)
+	SyncEpoch[player] = (SyncEpoch[player] or 0) + 1
+	return SyncEpoch[player]
+end
+
+-- ============================================================
+-- 🗃️ [CACHE] ANIMATION TRACK CACHE PER ANIMATOR
+-- ============================================================
+-- LoadAnimation hanya dilakukan SEKALI per (animator, animId).
+-- Pemanggilan berikutnya cukup Track:Play(). Cache dibersihkan
+-- otomatis saat Animator dihancurkan (respawn / player leave).
+local TrackCache = {} -- [animator] = { [animId] = AnimationTrack }
+
+local function getCachedTrack(animator, animId)
+	if not animator or not animId then return nil end
+
+	local bucket = TrackCache[animator]
+	if not bucket then
+		bucket = {}
+		TrackCache[animator] = bucket
+		animator.Destroying:Connect(function()
+			local b = TrackCache[animator]
+			if b then
+				for _, track in pairs(b) do
+					pcall(function() track:Destroy() end)
+				end
+				TrackCache[animator] = nil
+			end
+		end)
+	end
+
+	local track = bucket[animId]
+	if track then return track end
+
+	local anim = Instance.new("Animation")
+	anim.AnimationId = animId
+	local ok, newTrack = pcall(animator.LoadAnimation, animator, anim)
+	if not ok or not newTrack then return nil end
+
+	bucket[animId] = newTrack
+	return newTrack
+end
+
+-- [v3.4-A] Tunggu asset animasi siap (Length > 0). TimePosition
+-- pada track dengan Length = 0 DIAM-DIAM ter-clamp ke 0 — inilah
+-- penyebab follower mulai dari detik 0 pada sync pertama.
+local function waitTrackReady(track, timeout)
+	if not track then return false end
+	if track.Length > 0 then return true end
+	local deadline = os.clock() + (timeout or CONFIG.TRACK_READY_TIMEOUT)
+	while track.Length == 0 and os.clock() < deadline do
+		task.wait(0.03)
+	end
+	return track.Length > 0
+end
+
+-- ============================================================
+-- 🛠️ UTIL
+-- ============================================================
+local function sendNotification(player, title, message)
+	pcall(function() notifRemote:FireClient(player, title, message, 3) end)
+end
+
+local function fireStatus(player, isSyncing, leaderName)
+	pcall(function() syncStatusEvent:FireClient(player, isSyncing, leaderName or "") end)
+end
+
+local function shouldIgnoreAnimation(track)
+	if not track or not track.Animation then return true end
+	if IGNORED_PRIORITIES[track.Priority] then return true end
+	if IGNORED_NAMES[track.Animation.Name:lower()] then return true end
+	return false
+end
+
+local function getAnimator(player)
+	local char = player and player.Character
+	local humanoid = char and char:FindFirstChildWhichIsA("Humanoid")
+	return humanoid and humanoid:FindFirstChildOfClass("Animator"), humanoid
+end
+
+local function validatePlayerCharacter(player)
+	if not player or not player.Parent then return false end
+	local char = player.Character
+	if not char or not char.Parent then return false end
+	local humanoid = char:FindFirstChildWhichIsA("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return false end
+	return true
+end
+
+-- Peta trek dance aktif milik seorang pemain: { [animId] = track }
+-- [v3.4-B] Trek yang sedang FADE-OUT (WeightTarget = 0) diabaikan.
+-- Saat leader ganti Dance A → B, A masih IsPlaying selama 0.15 dtk
+-- fade — tanpa filter ini, resync yang menyala di jendela itu akan
+-- menyalin A DAN B ke follower (double animation).
+local function getActiveDanceTracks(animator)
+	local map = {}
+	if not animator then return map end
+	for _, track in pairs(animator:GetPlayingAnimationTracks()) do
+		if track.IsPlaying and not shouldIgnoreAnimation(track) then
+			local fadingOut = false
+			pcall(function()
+				fadingOut = (track.WeightTarget <= 0)
+			end)
+			if not fadingOut then
+				map[track.Animation.AnimationId] = track
+			end
+		end
+	end
+	return map
+end
+
+local function stopAllDanceAnimations(animator, fadeTime)
+	if not animator then return end
+	for _, track in pairs(animator:GetPlayingAnimationTracks()) do
+		if not shouldIgnoreAnimation(track) then
+			pcall(function() track:Stop(fadeTime or CONFIG.FADE_TIME) end)
+		end
+	end
+end
+
+local function clearConnections(player)
+	if SyncConnections[player] then
+		for _, conn in ipairs(SyncConnections[player]) do
+			if conn and typeof(conn) == "RBXScriptConnection" and conn.Connected then
+				pcall(function() conn:Disconnect() end)
+			end
+		end
+		SyncConnections[player] = nil
+	end
+end
+
+-- Trek follower ter-cache: cukup Stop dengan fade, tidak di-Destroy.
+local function stopFollowerTracks(player, fadeTime)
+	bumpEpoch(player) -- [v3.4-A] batalkan thread play yang tertunda
+	if FollowerTracks[player] then
+		for _, track in pairs(FollowerTracks[player]) do
+			pcall(function() track:Stop(fadeTime or CONFIG.FADE_TIME) end)
+		end
+		FollowerTracks[player] = nil
+	end
+end
+
+-- Trek titipan /re adalah orphan (bukan cache) → tetap dihancurkan.
+local function clearRestoredTracks(player)
+	if RestoredTracks[player] then
+		for _, track in ipairs(RestoredTracks[player]) do
+			pcall(function()
+				track:Stop(CONFIG.FADE_TIME)
+				track:Destroy()
+			end)
+		end
+		RestoredTracks[player] = nil
+	end
+end
+
+local function removeFollower(follower, leader)
+	local list = FollowersList[leader]
+	if list then
+		for i, f in ipairs(list) do
+			if f == follower then
+				table.remove(list, i)
+				break
+			end
+		end
+	end
+end
+
+local function addFollower(follower, leader)
+	if not FollowersList[leader] then FollowersList[leader] = {} end
+	for _, f in ipairs(FollowersList[leader]) do
+		if f == follower then return end
+	end
+	table.insert(FollowersList[leader], follower)
+end
+
+local function softDisconnect(player)
+	local leader = ActiveSyncs[player]
+	if leader then
+		removeFollower(player, leader)
+		ActiveSyncs[player] = nil
+	end
+	clearConnections(player)
+	stopFollowerTracks(player)
+end
+
+-- ============================================================
+-- 🌐 GATHER NETWORK (SNAPSHOT SELURUH JARINGAN — BFS)
+-- ============================================================
+local function gatherNetwork(root)
+	local members = {}
+	local seen = { [root] = true }
+	local queue = { root }
+
+	while #queue > 0 do
+		local current = table.remove(queue, 1)
+		local followers = FollowersList[current]
+		if followers then
+			for _, follower in ipairs(followers) do
+				if not seen[follower] then
+					seen[follower] = true
+					table.insert(members, follower)
+					table.insert(queue, follower)
+				end
+			end
+		end
+	end
+
+	return members
+end
+
+-- Forward declaration
+local sync
+
+local function stopSync(player)
+	if not player then return end
+	softDisconnect(player)
+	clearRestoredTracks(player)
+
+	local animator = getAnimator(player)
+	if animator then stopAllDanceAnimations(animator) end
+
+	fireStatus(player, false)
+end
+
+-- ============================================================
+-- 👑 SUCCESSION & TRANSFER (snapshot atomik — anti mutasi iterasi)
+-- ============================================================
+local function handleLeaderTransfer(oldLeader, newLeader)
+	local members = gatherNetwork(oldLeader)
+	if #members == 0 then return end
+
+	-- FASE 1: putuskan seluruh referensi lama
+	for _, member in ipairs(members) do
+		clearConnections(member)
+		stopFollowerTracks(member)
+		ActiveSyncs[member] = nil
+		FollowersList[member] = nil
+	end
+	FollowersList[oldLeader] = nil
+
+	-- FASE 2: bangun ulang jaringan FLAT di bawah newLeader
+	for _, member in ipairs(members) do
+		if member ~= newLeader and validatePlayerCharacter(member) then
+			ActiveSyncs[member] = newLeader
+			addFollower(member, newLeader)
+
+			task.spawn(function()
+				sync(member, newLeader)
+				sendNotification(member, "Sistem Tarian", "Leader berpindah. Anda sekarang mengikuti " .. newLeader.DisplayName)
+				fireStatus(member, true, newLeader.DisplayName)
+			end)
+		end
+	end
+end
+
+local function handleSuccession(deadLeader)
+	local members = gatherNetwork(deadLeader)
+
+	for _, member in ipairs(members) do
+		clearConnections(member)
+		ActiveSyncs[member] = nil
+		FollowersList[member] = nil
+	end
+	FollowersList[deadLeader] = nil
+
+	if #members == 0 then return end
+
+	local newLeader = nil
+	for i, member in ipairs(members) do
+		if validatePlayerCharacter(member) then
+			newLeader = member
+			table.remove(members, i)
+			break
+		end
+	end
+
+	if newLeader then
+		-- Promosi tanpa membunuh tarian newLeader (trek dibiarkan jalan)
+		sendNotification(newLeader, "Sistem Tarian", "Leader terputus. Anda mengambil alih kepemimpinan.")
+		fireStatus(newLeader, false)
+
+		for _, member in ipairs(members) do
+			stopFollowerTracks(member)
+			ActiveSyncs[member] = newLeader
+			addFollower(member, newLeader)
+
+			task.spawn(function()
+				sync(member, newLeader)
+				sendNotification(member, "Sistem Tarian", "Leader terputus. Anda sekarang mengikuti " .. newLeader.DisplayName)
+				fireStatus(member, true, newLeader.DisplayName)
+			end)
+		end
+	else
+		for _, member in ipairs(members) do
+			stopSync(member)
+			sendNotification(member, "Sistem Tarian", "Sesi Sync berakhir karena Leader terputus.")
+		end
+	end
+end
+
+-- ============================================================
+-- 🔗 SINKRONISASI AWAL (CATCHUP)
+-- ============================================================
+-- [v3.4-A] Dua jalur:
+--   • JALUR PANAS (track ter-cache, Length > 0): play + time-lock
+--     SINKRON pada frame yang sama — identik dengan v3 stabil.
+--   • JALUR DINGIN (animasi belum pernah dimuat): tunggu asset
+--     siap dulu, dijaga epoch agar batal otomatis bila state
+--     follower berubah selama penungguan.
+sync = function(player, target)
+	if not validatePlayerCharacter(player) or not validatePlayerCharacter(target) then return end
+
+	local animator1, humanoid1 = getAnimator(player)
+	local animator2 = getAnimator(target)
+
+	clearConnections(player)
+	stopFollowerTracks(player)
+	clearRestoredTracks(player)
+	SyncConnections[player] = {}
+	FollowerTracks[player] = {}
+
+	local myEpoch = bumpEpoch(player) -- epoch milik sesi sync ini
+
+	if not animator1 or not animator2 then return end
+	stopAllDanceAnimations(animator1)
+
+	for animId, leaderTrack in pairs(getActiveDanceTracks(animator2)) do
+		local track = getCachedTrack(animator1, animId)
+		if track then
+			FollowerTracks[player][animId] = track
+
+			local function playLocked()
+				pcall(function()
+					track.Priority = leaderTrack.Priority
+					track.Looped = leaderTrack.Looped
+
+					track:Play(CONFIG.FADE_TIME)
+					track:AdjustSpeed(leaderTrack.Speed)
+					-- Time-lock LIVE + lead compensation: bidik sedikit di depan
+					-- posisi leader untuk mengimbangi latency replikasi.
+					local target = leaderTrack.TimePosition + CONFIG.LEAD_COMPENSATION
+					if leaderTrack.Looped and track.Length > 0 then
+						target = target % track.Length
+					end
+					track.TimePosition = target
+				end)
+
+				-- Pengaman satu frame: pastikan posisi terkunci setelah Play
+				task.defer(function()
+					if SyncEpoch[player] ~= myEpoch then return end
+					if track.IsPlaying and leaderTrack.IsPlaying and track.Length > 0 then
+						pcall(function()
+							local t = leaderTrack.TimePosition + CONFIG.LEAD_COMPENSATION
+							if leaderTrack.Looped and track.Length > 0 then
+								t = t % track.Length
+							end
+							track.TimePosition = t
+						end)
+					end
+				end)
+			end
+
+			if track.Length > 0 then
+				-- ⚡ JALUR PANAS: sinkron, identik dengan v3
+				playLocked()
+			else
+				-- 🧊 JALUR DINGIN: hanya untuk animasi yang belum pernah
+				-- dimuat — tunggu siap, lalu play jika sesi masih valid.
+				task.spawn(function()
+					if not waitTrackReady(track) then return end
+					if SyncEpoch[player] ~= myEpoch then return end       -- state berubah → batal
+					if ActiveSyncs[player] ~= target then return end       -- sync berpindah → batal
+					if not leaderTrack.IsPlaying then return end           -- leader sudah berhenti → batal
+					playLocked()
+				end)
+			end
+		end
+	end
+
+	-- Failsafe: Animator baru muncul (respawn penuh) → re-sync cepat
+	if humanoid1 then
+		local rehookConn = humanoid1.ChildAdded:Connect(function(child)
+			if child:IsA("Animator") then
+				task.delay(CONFIG.REHOOK_DELAY, function()
+					if ActiveSyncs[player] == target then
+						sync(player, target)
+					end
+				end)
+			end
+		end)
+		table.insert(SyncConnections[player], rehookConn)
+	end
+end
+
+-- ============================================================
+-- 🔄 [DRIFT] CONTINUOUS SYNC & AUTO RE-SYNC
+-- ============================================================
+local function wrapDrift(drift, length, looped)
+	if looped and length and length > 0 then
+		drift = drift % length
+		if drift > length / 2 then
+			drift = drift - length
+		end
+	end
+	return drift
+end
+
+local function driftCorrect(follower, leader)
+	if ActiveSyncs[follower] ~= leader then return end
+	if not validatePlayerCharacter(follower) or not validatePlayerCharacter(leader) then return end
+
+	local fAnimator = getAnimator(follower)
+	local lAnimator = getAnimator(leader)
+	if not fAnimator or not lAnimator then return end
+
+	local leaderTracks = getActiveDanceTracks(lAnimator)
+	local followerTracks = FollowerTracks[follower] or {}
+
+	local needResync = false
+	for animId in pairs(leaderTracks) do
+		local fTrack = followerTracks[animId]
+		if not fTrack or not fTrack.IsPlaying then
+			needResync = true
+			break
+		end
+	end
+
+	if needResync then
+		local now = os.clock()
+		if now - (ResyncCooldown[follower] or 0) >= CONFIG.RESYNC_COOLDOWN then
+			ResyncCooldown[follower] = now
+			task.spawn(sync, follower, leader)
+		end
+		return
+	end
+
+	for animId, fTrack in pairs(followerTracks) do
+		local lTrack = leaderTracks[animId]
+		if lTrack and fTrack.IsPlaying then
+			-- Jangan menulis TimePosition ke track yang belum siap
+			if fTrack.Length > 0 and lTrack.Length > 0 then
+				pcall(function()
+					-- [BARU] Target follower = posisi leader + kompensasi lead.
+					-- Follower selalu tertinggal akibat latency replikasi, jadi
+					-- kita bidik sedikit di DEPAN posisi leader saat ini.
+					local leaderTarget = lTrack.TimePosition + CONFIG.LEAD_COMPENSATION
+					if lTrack.Looped and lTrack.Length > 0 then
+						leaderTarget = leaderTarget % lTrack.Length
+					end
+
+					local drift = wrapDrift(
+						leaderTarget - fTrack.TimePosition,
+						lTrack.Length,
+						lTrack.Looped
+					)
+					local absDrift = math.abs(drift)
+
+					if absDrift >= CONFIG.DRIFT_SNAP_THRESHOLD then
+						fTrack.TimePosition = leaderTarget
+						fTrack:AdjustSpeed(lTrack.Speed)
+					elseif absDrift > CONFIG.DRIFT_DEADZONE then
+						local nudge = math.clamp(
+							drift * CONFIG.DRIFT_NUDGE_GAIN,
+							-CONFIG.DRIFT_MAX_NUDGE,
+							CONFIG.DRIFT_MAX_NUDGE
+						)
+						fTrack:AdjustSpeed(lTrack.Speed * (1 + nudge))
+					else
+						if math.abs(fTrack.Speed - lTrack.Speed) > 0.001 then
+							fTrack:AdjustSpeed(lTrack.Speed)
+						end
+					end
+				end)
+			end
+		elseif not lTrack and fTrack.IsPlaying then
+			-- Leader sudah berhenti memainkan trek ini → follower ikut
+			pcall(function() fTrack:Stop(CONFIG.FADE_TIME) end)
+			followerTracks[animId] = nil
+		end
+	end
+end
+
+task.spawn(function()
+	while true do
+		task.wait(CONFIG.DRIFT_CHECK_INTERVAL)
+		for follower, leader in pairs(ActiveSyncs) do
+			pcall(driftCorrect, follower, leader)
+		end
+	end
+end)
+
+-- ============================================================
+-- 📡 EMOTE SPY SYSTEM — transisi fade + cache + anti-orphan
+-- ============================================================
+EmoteEvent.OnServerEvent:Connect(function(leader, action, value1, value2)
+	if action == "Play" or action == "Stop" then
+		clearRestoredTracks(leader)
+	elseif action == "Speed" then
+		local restored = RestoredTracks[leader]
+		if restored then
+			local speed = tonumber(value1) or 1
+			for _, track in ipairs(restored) do
+				pcall(function() track:AdjustSpeed(speed) end)
+			end
+		end
+	end
+
+	if FollowerTracks[leader] then
+		stopFollowerTracks(leader)
+	end
+
+	local followers = FollowersList[leader]
+	if not followers or #followers == 0 then return end
+
+	if action == "Play" then
+		local animId = value1
+		local speed = tonumber(value2) or 1
+		if type(animId) ~= "string" then return end
+
+		for _, follower in ipairs(followers) do
+			task.spawn(function()
+				if not validatePlayerCharacter(follower) then return end
+				local animator = getAnimator(follower)
+				if not animator then return end
+
+				-- [v3.4-B] Bersihkan registry DAN sapu animator langsung:
+				-- trek apa pun yang lolos registrasi (sisa race) ikut
+				-- dihentikan sebelum dance baru dimainkan → tidak akan
+				-- pernah ada double animation.
+				stopFollowerTracks(follower, CONFIG.FADE_TIME)
+				stopAllDanceAnimations(animator, CONFIG.FADE_TIME)
+				FollowerTracks[follower] = {}
+
+				local myEpoch = bumpEpoch(follower)
+
+				local track = getCachedTrack(animator, animId)
+				if not track then return end
+
+				FollowerTracks[follower][animId] = track
+
+				local function playNow()
+					pcall(function()
+						track.Priority = Enum.AnimationPriority.Action
+						track.Looped = true
+						track:Play(CONFIG.FADE_TIME)
+						track:AdjustSpeed(speed)
+					end)
+				end
+
+				if track.Length > 0 then
+					playNow() -- ⚡ jalur panas: identik v3
+				else
+					-- 🧊 jalur dingin dengan epoch guard
+					if not waitTrackReady(track) then return end
+					if SyncEpoch[follower] ~= myEpoch then return end
+					playNow()
+				end
+				-- Drift loop mengunci TimePosition ke leader dalam
+				-- <= DRIFT_CHECK_INTERVAL berikutnya.
+			end)
+		end
+	elseif action == "Stop" then
+		for _, follower in ipairs(followers) do
+			stopFollowerTracks(follower, CONFIG.FADE_TIME)
+			-- [v3.4-B] Sapu animator langsung: memastikan TIDAK ADA
+			-- animasi tersisa pada follower saat leader berhenti,
+			-- termasuk trek yatim yang lolos registrasi.
+			local animator = getAnimator(follower)
+			if animator then
+				stopAllDanceAnimations(animator, CONFIG.FADE_TIME)
+			end
+		end
+	elseif action == "Speed" then
+		local speed = tonumber(value1) or 1
+		for _, follower in ipairs(followers) do
+			if FollowerTracks[follower] then
+				for _, track in pairs(FollowerTracks[follower]) do
+					pcall(function() track:AdjustSpeed(speed) end)
+				end
+			end
+		end
+	end
+end)
+
+-- ============================================================
+-- ⚡ RE-HOOK INSTAN SETELAH /re (AnimatorRefreshed) — persis v3
+-- ============================================================
+animatorRefreshed.Event:Connect(function(player, restoredTrackList)
+	if not player then return end
+
+	RestoredTracks[player] = nil
+	if restoredTrackList and #restoredTrackList > 0 then
+		RestoredTracks[player] = restoredTrackList
+	end
+
+	-- Follower yang /re → rebuild langsung
+	local leader = ActiveSyncs[player]
+	if leader then
+		task.spawn(function()
+			if validatePlayerCharacter(player) and validatePlayerCharacter(leader) then
+				sync(player, leader)
+			end
+		end)
+	end
+
+	-- Leader yang /re → koreksi presisi seluruh follower seketika
+	local followers = FollowersList[player]
+	if followers and #followers > 0 then
+		for _, follower in ipairs(table.clone(followers)) do
+			task.spawn(function()
+				pcall(driftCorrect, follower, player)
+			end)
+		end
+	end
+end)
+
+-- ============================================================
+-- 📡 EVENT LISTENERS GLOBAL & CLEANUP RESOURCE — persis v3
+-- ============================================================
+local function onLeaderDied(player)
+	task.delay(0.1, function()
+		if FollowersList[player] and #FollowersList[player] > 0 then
+			handleSuccession(player)
+		end
+		if ActiveSyncs[player] then
+			stopSync(player)
+		end
+	end)
+end
+
+Players.PlayerRemoving:Connect(function(player)
+	onLeaderDied(player)
+	PlayerUsage[player] = nil
+	RestoredTracks[player] = nil
+	ResyncCooldown[player] = nil
+	FollowerTracks[player] = nil
+	SyncEpoch[player] = nil
+	clearConnections(player)
+end)
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function(char)
+		RestoredTracks[player] = nil
+		FollowerTracks[player] = nil
+		bumpEpoch(player) -- thread play tertunda milik karakter lama batal
+
+		local humanoid = char:WaitForChild("Humanoid", 5)
+		if humanoid then
+			humanoid.Died:Connect(function() onLeaderDied(player) end)
+		end
+	end)
+end)
+
+-- ============================================================
+-- 🎮 SYNC / STOPSYNC HANDLERS (alur pemain tidak berubah)
+-- ============================================================
+syncEvent.OnServerEvent:Connect(function(player, target)
+	if not player or not target or typeof(target) ~= "Instance" or not target:IsA("Player") then return end
+
+	local now = tick()
+	local lastUsed = PlayerUsage[player] or 0
+	if now - lastUsed < CONFIG.RATE_LIMIT_COOLDOWN then return end
+	PlayerUsage[player] = now
+
+	-- ⛔ Pencegahan circular sync (rantai + jaringan penuh)
+	local checkTarget = target
+	while checkTarget do
+		if checkTarget == player then
+			sendNotification(player, "Sistem Tarian", "Tidak dapat mengikuti pemain yang sedang mengikuti Anda.")
+			return
+		end
+		checkTarget = ActiveSyncs[checkTarget]
+	end
+
+	for _, member in ipairs(gatherNetwork(player)) do
+		if member == target then
+			sendNotification(player, "Sistem Tarian", "Tidak dapat mengikuti pemain yang sedang mengikuti Anda.")
+			return
+		end
+	end
+
+	-- 🔄 Resolusi leader (graph flattening)
+	local rootTarget = target
+	while ActiveSyncs[rootTarget] do
+		rootTarget = ActiveSyncs[rootTarget]
+	end
+	target = rootTarget
+
+	-- 🔄 Transfer leader (seluruh jaringan: direct + nested)
+	if FollowersList[player] and #FollowersList[player] > 0 then
+		player:SetAttribute("IsLeaderTransfer", true)
+		task.delay(3, function() if player then player:SetAttribute("IsLeaderTransfer", nil) end end)
+		handleLeaderTransfer(player, target)
+		task.delay(0.5, function()
+			sendNotification(player, "Transfer Jaringan", "Anda membawa pengikut bergabung ke jaringan " .. target.DisplayName)
+		end)
+	end
+
+	if ActiveSyncs[player] then
+		removeFollower(player, ActiveSyncs[player])
+	end
+
+	ActiveSyncs[player] = target
+	addFollower(player, target)
+	sync(player, target)
+
+	fireStatus(player, true, target.DisplayName)
+end)
+
+stopSyncEvent.OnServerEvent:Connect(function(player)
+	if player then
+		stopSync(player)
+	end
+end)
