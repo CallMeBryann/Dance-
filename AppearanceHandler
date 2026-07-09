@@ -1,0 +1,167 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local AppearanceHandler = {}
+
+local CONFIG = {
+	DEBOUNCE_TIME = 3,
+	REBUILD_WAIT = 0.2, -- Jeda krusial: tunggu engine me-rebuild joints & scaling
+}
+
+local debounceTable = {}
+
+-- ============================================================
+-- SINYAL RE-HOOK KE SISTEM SYNC
+-- ============================================================
+local function getAnimatorRefreshedSignal()
+	local setModule = ReplicatedStorage:FindFirstChild("SetModule")
+	local syncRemote = setModule and setModule:FindFirstChild("SyncRemote")
+	if not syncRemote then return nil end
+
+	local signal = syncRemote:FindFirstChild("AnimatorRefreshed")
+	if not signal then
+		signal = Instance.new("BindableEvent")
+		signal.Name = "AnimatorRefreshed"
+		signal.Parent = syncRemote
+	end
+	return signal
+end
+
+function AppearanceHandler.reload(player)
+	local userId = player.UserId
+	local now = os.clock()
+	if debounceTable[userId] and (now - debounceTable[userId]) < CONFIG.DEBOUNCE_TIME then
+		return false, "Cooldown"
+	end
+	debounceTable[userId] = now
+
+	local character = player.Character
+	if not character then return false, "No Character" end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return false, "No Humanoid" end
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+
+	-- 1. BACKUP TOOLS
+	local savedTools = {}
+	for _, tool in ipairs(character:GetChildren()) do
+		if tool:IsA("Tool") then
+			table.insert(savedTools, tool)
+			tool.Parent = player.Backpack
+		end
+	end
+
+	-- 2. REFERENSI OVERHEAD (TANPA DETACH)
+	-- ApplyDescription tidak menyentuh BillboardGui di dalam HRP, jadi
+	-- instance dibiarkan di tempatnya agar replika client (beserta semua
+	-- pewarnaan client-side) tidak pernah dihancurkan.
+	local hrp = character:FindFirstChild("HumanoidRootPart")
+	local savedOverhead = hrp and hrp:FindFirstChild("OverheadUI")
+
+	-- 3. BACKUP ANIMASI (Sync & Dance) + timestamp untuk kompensasi waktu
+	local backupClock = os.clock()
+	local savedAnimations = {}
+	if animator then
+		for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
+			if track.Animation then
+				table.insert(savedAnimations, {
+					Animation = track.Animation,
+					Speed = track.Speed,
+					TimePosition = track.TimePosition,
+					Length = track.Length,
+					Weight = track.WeightCurrent,
+					Priority = track.Priority,
+					Looped = track.Looped
+				})
+			end
+		end
+	end
+
+	-- 4. FETCH AVATAR
+	local success, description = pcall(Players.GetHumanoidDescriptionFromUserId, Players, userId)
+	if not success or not description then
+		debounceTable[userId] = nil
+		return false, "Failed to get description"
+	end
+
+	-- 5. APPLY DESCRIPTION (Soft Reload)
+	local applySuccess = pcall(function()
+		humanoid:ApplyDescription(description)
+	end)
+	if not applySuccess then
+		debounceTable[userId] = nil
+		return false, "Failed to apply"
+	end
+
+	-- JEDA KRUSIAL: Tunggu engine Roblox selesai me-rebuild joints dan scaling kepala
+	task.wait(CONFIG.REBUILD_WAIT)
+
+	-- 6. PERBAIKI ADORNEE OVERHEAD (satu-satunya yang mungkin berubah)
+	if savedOverhead and savedOverhead.Parent then
+		local newHead = character:FindFirstChild("Head")
+		if newHead then
+			savedOverhead.Adornee = newHead
+		end
+		savedOverhead.StudsOffset = Vector3.new(0, 2.5, 0)
+	end
+
+	-- 7. RESTORE TOOLS
+	for _, tool in ipairs(savedTools) do
+		if tool and tool.Parent == player.Backpack then
+			tool.Parent = character
+		end
+	end
+
+	-- 8. RESTORE ANIMASI (dengan KOMPENSASI WAKTU)
+	-- [PERBAIKAN STOP TIDAK BERFUNGSI SETELAH /re]:
+	-- Trek hasil restore ini adalah trek BARU yang tidak dikenali oleh
+	-- sistem emote (yang masih memegang referensi trek lama yang sudah
+	-- mati). Tanpa registrasi, trek ini menjadi "yatim": tombol Stop,
+	-- toggle, dan slider Speed tidak lagi bisa menjangkaunya.
+	-- Solusi: kumpulkan referensinya lalu SERAHKAN ke DynamicSync
+	-- melalui sinyal AnimatorRefreshed (langkah 9).
+	local restoredTracks = {}
+	local newAnimator = humanoid:FindFirstChildOfClass("Animator")
+	if newAnimator then
+		local elapsed = os.clock() - backupClock
+
+		for _, animData in ipairs(savedAnimations) do
+			if animData.Animation then
+				pcall(function()
+					local newTrack = newAnimator:LoadAnimation(animData.Animation)
+					newTrack.Priority = animData.Priority
+					newTrack.Looped = animData.Looped
+					newTrack:Play(0, animData.Weight, animData.Speed)
+
+					local targetTime = animData.TimePosition + (elapsed * animData.Speed)
+					local length = animData.Length or newTrack.Length
+
+					if length and length > 0 then
+						if animData.Looped then
+							targetTime = targetTime % length
+						else
+							targetTime = math.min(targetTime, length)
+						end
+					end
+
+					newTrack.TimePosition = targetTime
+					table.insert(restoredTracks, newTrack)
+				end)
+			end
+		end
+	end
+
+	-- 9. SERAHKAN KEPEMILIKAN TREK RESTORE KE SISTEM SYNC
+	-- DynamicSync menyimpannya sebagai RestoredTracks[player] dan akan:
+	--  • menghentikannya saat player menekan Stop / memilih dance baru,
+	--  • menyesuaikan kecepatannya saat slider Speed digeser,
+	--  • me-rebuild sync jika player ini follower,
+	--  • meluruskan timing follower jika player ini Leader.
+	local refreshedSignal = getAnimatorRefreshedSignal()
+	if refreshedSignal then
+		pcall(function() refreshedSignal:Fire(player, restoredTracks) end)
+	end
+
+	return true
+end
+
+return AppearanceHandler
