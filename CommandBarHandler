@@ -1,0 +1,202 @@
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
+local Players = game:GetService("Players") -- [DITAMBAHKAN]: Service Players dibutuhkan untuk fitur Chat Interceptor
+
+local screenGui = script.Parent
+local mainFrame = screenGui:WaitForChild("MainFrame")
+local openButton = screenGui:WaitForChild("OpenButton")
+local icon = openButton:WaitForChild("Icon")
+local scrollingFrame = mainFrame:WaitForChild("Container")
+
+local isMenuOpen = false
+local isAnimating = false
+
+local tweenInfo = TweenInfo.new(0.25, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+local rotateInfo = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+local commandEvent = ReplicatedStorage:WaitForChild("SetModule"):WaitForChild("KonfigurasiSystemSoftware"):WaitForChild("RemotedCmd"):WaitForChild("CommandEvent")
+
+-- ==================== DYNAMIC SIZE SETUP ====================
+local OPEN_SIZE = mainFrame.Size 
+local CLOSED_SIZE = UDim2.new(OPEN_SIZE.X.Scale, OPEN_SIZE.X.Offset, 0, 30)
+
+mainFrame.Size = CLOSED_SIZE
+mainFrame.Visible = false
+
+-- ==================== VISUALS ====================
+local function SyncButtonVisuals()
+	local targetBgColor = isMenuOpen 
+		and Color3.fromRGB(255, 255, 255) 
+		or Color3.fromRGB(24, 24, 27)
+
+	local targetContentColor = isMenuOpen 
+		and Color3.fromRGB(24, 24, 27) 
+		or Color3.fromRGB(255, 255, 255)
+
+	local targetIcon = isMenuOpen 
+		and "rbxassetid://97639482001730" 
+		or "rbxassetid://138456733400090"
+
+	TweenService:Create(openButton, tweenInfo, {
+		BackgroundColor3 = targetBgColor
+	}):Play()
+
+	local fadeOut = TweenService:Create(icon, TweenInfo.new(0.12), {
+		ImageTransparency = 1
+	})
+	fadeOut:Play()
+
+	fadeOut.Completed:Connect(function()
+		icon.Image = targetIcon
+
+		local fadeIn = TweenService:Create(icon, TweenInfo.new(0.15), {
+			ImageTransparency = 0,
+			ImageColor3 = targetContentColor
+		})
+		fadeIn:Play()
+	end)
+end
+
+local function playRotateAnimation()
+	if isAnimating then return end
+	isAnimating = true
+
+	local rotateTween = TweenService:Create(icon, rotateInfo, { Rotation = 360 })
+	rotateTween:Play()
+
+	rotateTween.Completed:Connect(function()
+		icon.Rotation = 0
+		isAnimating = false
+	end)
+end
+
+-- ==================== TOGGLE MENU ====================
+local function toggleMenu()
+	isMenuOpen = not isMenuOpen
+
+	if isMenuOpen then
+		mainFrame.Visible = true
+		mainFrame.Size = CLOSED_SIZE
+		mainFrame.BackgroundTransparency = 1
+
+		local goal = {
+			Size = OPEN_SIZE,
+			BackgroundTransparency = 0.08
+		}
+		TweenService:Create(mainFrame, tweenInfo, goal):Play()
+	else
+		local goal = {
+			Size = CLOSED_SIZE,
+			BackgroundTransparency = 1
+		}
+		local tween = TweenService:Create(mainFrame, tweenInfo, goal)
+		tween:Play()
+		tween.Completed:Connect(function()
+			if not isMenuOpen then
+				mainFrame.Visible = false
+			end
+		end)
+	end
+
+	playRotateAnimation()
+	SyncButtonVisuals()
+end
+
+-- OpenButton memegang kendali penuh tanpa gangguan
+openButton.MouseButton1Click:Connect(toggleMenu)
+
+-- ==================== DYNAMIC COMMAND BUTTONS ====================
+local function connectCommandFrame(frame)
+	-- Mengabaikan UIListLayout atau UIPadding
+	if frame:IsA("GuiObject") then
+		-- Mencari tombol EXECUTE di dalam Frame command
+		local executeBtn = frame:FindFirstChild("EXECUTE")
+
+		if executeBtn and executeBtn:IsA("GuiButton") then
+			executeBtn.MouseButton1Click:Connect(function()
+				-- Mengambil nama command dari Frame induk (contoh: "/re" atau "/rejoin")
+				local action = string.lower(frame.Name)
+				action = string.gsub(action, "/", "")
+
+				if action == "re" then
+					action = "refresh"
+				end
+
+				commandEvent:FireServer(action)
+				if isMenuOpen then toggleMenu() end
+			end)
+		end
+	end
+end
+
+for _, child in ipairs(scrollingFrame:GetChildren()) do
+	connectCommandFrame(child)
+end
+
+scrollingFrame.ChildAdded:Connect(connectCommandFrame)
+
+-- ==================== CHAT INTERCEPTOR (SINGLE FLOW) ====================
+local player = Players.LocalPlayer
+
+player.Chatted:Connect(function(message)
+	local args = string.split(message, " ")
+	local command = string.lower(args[1] or "")
+
+	if command == "/re" or command == "/refresh" then
+		commandEvent:FireServer("refresh")
+	elseif command == "/rejoin" then
+		commandEvent:FireServer("rejoin")
+	end
+end)
+
+-- ==================== AUTO CLOSE & EVENT LISTENERS ====================
+mainFrame:GetPropertyChangedSignal("Visible"):Connect(function()
+	if not mainFrame.Visible and isMenuOpen then
+		isMenuOpen = false
+		SyncButtonVisuals()
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input)
+	if isMenuOpen and input.UserInputType == Enum.UserInputType.MouseButton1 then
+		-- Mengambil offset layar (TopBar) agar hitungan kursor presisi
+		local inset = GuiService:GetGuiInset()
+		local mouseLoc = UserInputService:GetMouseLocation()
+
+		-- Mengurangi offset agar mouse.Y sejajar dengan AbsolutePosition
+		local mouse = Vector2.new(mouseLoc.X - inset.X, mouseLoc.Y - inset.Y)
+
+		-- Kalkulasi area MainFrame
+		local framePos = mainFrame.AbsolutePosition
+		local frameSize = mainFrame.AbsoluteSize
+		local insideFrame = mouse.X >= framePos.X and mouse.X <= framePos.X + frameSize.X and
+			mouse.Y >= framePos.Y and mouse.Y <= framePos.Y + frameSize.Y
+
+		-- Kalkulasi area OpenButton
+		local btnPos = openButton.AbsolutePosition
+		local btnSize = openButton.AbsoluteSize
+		local insideBtn = mouse.X >= btnPos.X and mouse.X <= btnPos.X + btnSize.X and
+			mouse.Y >= btnPos.Y and mouse.Y <= btnPos.Y + btnSize.Y
+
+		-- Jika klik terjadi DI LUAR MainFrame DAN DI LUAR OpenButton, baru lakukan auto-close
+		if not insideFrame and not insideBtn then
+			isMenuOpen = false
+			SyncButtonVisuals()
+
+			local goal = {
+				Size = CLOSED_SIZE,
+				BackgroundTransparency = 1
+			}
+			TweenService:Create(mainFrame, tweenInfo, goal):Play()
+			task.delay(0.25, function()
+				if not isMenuOpen then
+					mainFrame.Visible = false
+				end
+			end)
+		end
+	end
+end)
+
+SyncButtonVisuals()
