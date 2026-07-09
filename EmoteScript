@@ -1,0 +1,108 @@
+-- ============================================================
+-- EMOTE SERVER v2 — UPGRADE (Track Cache + Instant Play)
+-- ============================================================
+-- Perbaikan dari versi lama:
+--   [FIX] task.wait(0.05) sebelum Play DIHAPUS — offset konstan
+--         yang membuat leader mulai terlambat dibanding follower.
+--   [FIX] Track TIDAK lagi di-Destroy setiap Play/Stop — di-cache
+--         per (animator, animId). LoadAnimation hanya sekali;
+--         pemutaran berikutnya instan via Track:Play().
+--   [FIX] Transisi memakai fade 0.15 dtk (selaras dengan sistem
+--         sync follower) — tidak ada T-Pose saat ganti dance.
+-- API tidak berubah: EmoteEvent ("Play"/"Stop"/"Speed") sama.
+-- ============================================================
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local SetModule = ReplicatedStorage:WaitForChild("SetModule")
+local Remotes = SetModule:WaitForChild("Remotes")
+local EmoteEvent = Remotes:WaitForChild("EmoteEvent")
+
+local FADE_TIME = 0.15
+
+local activeEmotes = {} -- [player] = AnimationTrack yang sedang dimainkan
+local TrackCache = {}   -- [animator] = { [animId] = AnimationTrack }
+
+local function getCachedTrack(animator, animId)
+	if not animator or type(animId) ~= "string" then return nil end
+
+	local bucket = TrackCache[animator]
+	if not bucket then
+		bucket = {}
+		TrackCache[animator] = bucket
+		animator.Destroying:Connect(function()
+			local b = TrackCache[animator]
+			if b then
+				for _, track in pairs(b) do
+					pcall(function() track:Destroy() end)
+				end
+				TrackCache[animator] = nil
+			end
+		end)
+	end
+
+	local track = bucket[animId]
+	if track then return track end
+
+	local anim = Instance.new("Animation")
+	anim.AnimationId = animId
+	local ok, newTrack = pcall(animator.LoadAnimation, animator, anim)
+	if not ok or not newTrack then return nil end
+
+	bucket[animId] = newTrack
+	return newTrack
+end
+
+EmoteEvent.OnServerEvent:Connect(function(player, action, value1, value2)
+	local character = player.Character
+	if not character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid or humanoid.Health <= 0 then return end
+	local animator = humanoid:FindFirstChildOfClass("Animator") or Instance.new("Animator", humanoid)
+
+	if action == "Play" then
+		local animId = value1
+		local speed = tonumber(value2) or 1
+		if type(animId) ~= "string" then return end
+
+		-- [FIX] Stop dengan fade, TANPA Destroy — track tetap di cache
+		if activeEmotes[player] then
+			pcall(function() activeEmotes[player]:Stop(FADE_TIME) end)
+			activeEmotes[player] = nil
+		end
+
+		local track = getCachedTrack(animator, animId)
+		if not track then return end
+
+		activeEmotes[player] = track
+		pcall(function()
+			track.Priority = Enum.AnimationPriority.Action
+			track.Looped = true
+			-- [FIX] Play SEKETIKA (task.wait(0.05) dihapus) dengan fade
+			track:Play(FADE_TIME)
+			track:AdjustSpeed(speed)
+		end)
+
+	elseif action == "Stop" then
+		if activeEmotes[player] then
+			pcall(function() activeEmotes[player]:Stop(FADE_TIME) end)
+			activeEmotes[player] = nil
+		end
+
+	elseif action == "Speed" then
+		local speed = tonumber(value1) or 1
+		if activeEmotes[player] then
+			pcall(function() activeEmotes[player]:AdjustSpeed(speed) end)
+		end
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	if activeEmotes[player] then
+		pcall(function() activeEmotes[player]:Stop() end)
+		activeEmotes[player] = nil
+	end
+	-- Cache track dibersihkan otomatis via animator.Destroying
+	-- saat karakter player dihancurkan.
+end)
