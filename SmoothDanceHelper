@@ -1,0 +1,443 @@
+-- By: BryannHTML
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local ContentProvider = game:GetService("ContentProvider")
+
+-- ✅ MENGGUNAKAN EMOTECONFIG DARI SETMODULE
+local EmoteConfig = require(ReplicatedStorage.SetModule.EmoteConfig)
+
+local SmoothDanceHelper = {}
+local SmoothDanceManager = nil
+local hasSmoothDanceManager = false
+
+-- Fungsi pembantu untuk mengambil tabel emote dari config
+local function getEmoteList()
+	return EmoteConfig.dances or EmoteConfig.emotes or EmoteConfig
+end
+
+local success, result = pcall(function()
+	return require(script.Parent.SmoothDanceManager)
+end)
+
+if success then
+	SmoothDanceManager = result
+	hasSmoothDanceManager = true
+else
+	
+	hasSmoothDanceManager = false
+end
+
+local managers = {}
+local fallbackStates = {}
+
+function SmoothDanceHelper.initializePlayer(player)
+	if managers[player] then
+		pcall(function()
+			managers[player]:destroy()
+		end)
+		managers[player] = nil
+	end
+
+	if hasSmoothDanceManager and SmoothDanceManager then
+		local successInit, managerInstance = pcall(function()
+			return SmoothDanceManager.new(player)
+		end)
+
+		if successInit then
+			local popularDances = {}
+			local danceNames = {
+				"Fresh",
+				"Floss",
+				"Gangnam style",
+				"New Dance 01",
+				"New Dance 02"
+			}
+
+			local emoteList = getEmoteList()
+			for _, name in ipairs(danceNames) do
+				local animId = emoteList[name]
+				if animId then
+					table.insert(popularDances, animId)
+				end
+			end
+
+			if #popularDances > 0 then
+				managerInstance:preloadPopularAnimations(popularDances, {
+					batchSize = 6,
+					prewarm = true,
+					loadToCache = true
+				})
+			end
+
+			managers[player] = managerInstance
+			
+			return managerInstance
+		end
+
+	end
+
+	managers[player] = false
+
+	return false
+end
+
+function SmoothDanceHelper.getManager(player)
+	if managers[player] == nil then
+		return SmoothDanceHelper.initializePlayer(player)
+	elseif managers[player] == false then
+		return nil
+	else
+		return managers[player]
+	end
+end
+
+function SmoothDanceHelper.playDance(player, danceName, options)
+	local manager = SmoothDanceHelper.getManager(player)
+	if manager then
+		return manager:playDance(danceName, options)
+	end
+
+	local animOptions = options or {}
+	local fadeIn = animOptions.fadeIn or 0.5
+	local fadeOut = animOptions.fadeOut or 0.5
+	local speed = animOptions.speed or 1
+	local doCrossFade = animOptions.crossFade ~= false
+
+	local character = player.Character
+	if not character then return false end
+
+	local humanoid = character:FindFirstChild("Humanoid")
+	local animator = humanoid and humanoid:FindFirstChild("Animator")
+	if not animator then return false end
+
+	local emoteList = getEmoteList()
+	local danceId = emoteList[danceName]
+
+	if not danceId then
+		
+		return false
+	end
+
+	local currentInfo = SmoothDanceHelper.getCurrentInfo(player)
+	if currentInfo.isPlaying and currentInfo.name ~= danceName then
+		if doCrossFade then
+		
+		else
+			SmoothDanceHelper.stopDance(player, fadeOut)
+			task.wait(fadeOut + 0.1)
+		end
+	end
+
+	local animation = Instance.new("Animation")
+	animation.Name = danceName
+	animation.AnimationId = "rbxassetid://" .. danceId
+
+	local track = animator:LoadAnimation(animation)
+	track.Priority = Enum.AnimationPriority.Action
+	track.Looped = true
+	animation:Destroy()
+
+	if doCrossFade and currentInfo.isPlaying then
+		track:Play(fadeIn, 1, 0)
+		if currentInfo.track then
+			currentInfo.track:Stop(fadeOut)
+		end
+		task.spawn(function()
+			task.wait(math.max(fadeIn, fadeOut) + 0.1)
+			if track.IsPlaying then
+				track:AdjustSpeed(speed)
+			end
+		end)
+	else
+		track:Play(fadeIn)
+		task.spawn(function()
+			task.wait(fadeIn + 0.1)
+			if track.IsPlaying then
+				track:AdjustSpeed(speed)
+			end
+		end)
+	end
+
+	fallbackStates[player.UserId] = {
+		track = track,
+		name = danceName,
+		speed = speed,
+		startTime = tick()
+	}
+
+	return true
+end
+
+function SmoothDanceHelper.stopDance(player, fadeOutTime)
+	local manager = managers[player]
+	if manager then
+		local successStop, resultStop = pcall(function()
+			return manager:stopDance(fadeOutTime or 0.8)
+		end)
+		if successStop then
+			return resultStop
+		end
+		warn("SmoothDanceManager error (preserving fallback): " .. tostring(resultStop))
+	end
+
+	local userId = player.UserId
+	if fallbackStates[userId] and fallbackStates[userId].track then
+		local track = fallbackStates[userId].track
+		if track.IsPlaying then
+			track:Stop(fadeOutTime or 0.8)
+			fallbackStates[userId] = nil
+			return true
+		end
+	end
+	return false
+end
+
+function SmoothDanceHelper.stopAll(player)
+	local manager = managers[player]
+	if manager then
+		manager:stopAll()
+		return true
+	end
+
+	local character = player.Character
+	if character then
+		local humanoid = character:FindFirstChild("Humanoid")
+		if humanoid then
+			for _, track in pairs(humanoid:GetPlayingAnimationTracks()) do
+				track:Stop()
+			end
+		end
+	end
+
+	fallbackStates[player.UserId] = nil
+	return true
+end
+
+function SmoothDanceHelper.setSpeed(player, speed, fadeTime)
+	local manager = managers[player]
+	if manager then
+		return manager:setSpeed(speed, fadeTime or 0.2)
+	end
+
+	local userId = player.UserId
+	if fallbackStates[userId] and fallbackStates[userId].track then
+		local track = fallbackStates[userId].track
+		if track.IsPlaying then
+			track:AdjustSpeed(speed)
+			fallbackStates[userId].speed = speed
+			return true
+		end
+	end
+	return false
+end
+
+function SmoothDanceHelper.getCurrentInfo(player)
+	local manager = managers[player]
+	if manager then
+		return manager:getCurrentInfo()
+	end
+
+	local userId = player.UserId
+	if not fallbackStates[userId] then
+		return {
+			isPlaying = false,
+			name = nil,
+			speed = 1
+		}
+	end
+
+	local state = fallbackStates[userId]
+	local isPlaying = state.track and state.track.IsPlaying or false
+
+	return {
+		isPlaying = isPlaying,
+		name = state.name,
+		speed = state.speed or 1,
+		track = state.track,
+		startTime = state.startTime,
+		timePosition = state.track and state.track.TimePosition or 0
+	}
+end
+
+function SmoothDanceHelper.syncAnimation(player, danceName, speed, serverTime, options)
+	local manager = SmoothDanceHelper.getManager(player)
+	local animOptions = options or {}
+
+	animOptions.speed = speed
+	animOptions.serverTime = serverTime
+	animOptions.normalizedTime = animOptions.normalizedTime or 0
+	animOptions.fadeIn = animOptions.fadeIn or 0.25
+	animOptions.fadeOut = animOptions.fadeOut or 0.25
+
+	if manager then
+		return manager:playDance(danceName, animOptions)
+	else
+		return SmoothDanceHelper.playDance(player, danceName, animOptions)
+	end
+end
+
+function SmoothDanceHelper.preloadPopularAnimations(player, danceList)
+	local manager = SmoothDanceHelper.getManager(player)
+	local emoteList = getEmoteList()
+
+	if not manager then
+		task.spawn(function()
+			local animationsToPreload = {}
+			for _, danceName in ipairs(danceList or {}) do
+				local animId = emoteList[danceName]
+				if animId then
+					table.insert(animationsToPreload, "rbxassetid://" .. animId)
+				end
+			end
+
+			if #animationsToPreload > 0 then
+				local successPreload, resultPreload = pcall(function()
+					ContentProvider:PreloadAsync(animationsToPreload)
+				end)
+				if successPreload then
+					
+					return
+				end
+			
+			end
+		end)
+
+		return {
+			ok = true,
+			count = #danceList,
+			total = #danceList
+		}
+	end
+
+	local animationIds = {}
+	for _, danceName in ipairs(danceList or {}) do
+		local animId = emoteList[danceName]
+		if animId then
+			table.insert(animationIds, animId)
+		end
+	end
+
+	if #animationIds <= 0 then
+		return {
+			ok = true,
+			count = 0,
+			total = 0
+		}
+	else
+		return manager:preloadPopularAnimations(animationIds, {
+			batchSize = 6,
+			prewarm = true,
+			loadToCache = true
+		})
+	end
+end
+
+function SmoothDanceHelper.cleanupPlayer(player)
+	if managers[player] and managers[player] ~= false then
+		pcall(function()
+			managers[player]:destroy()
+		end)
+	end
+	managers[player] = nil
+
+	local userId = player.UserId
+	if fallbackStates[userId] then
+		if fallbackStates[userId].track then
+			pcall(function()
+				fallbackStates[userId].track:Stop()
+			end)
+		end
+		fallbackStates[userId] = nil
+	end
+
+end
+
+function SmoothDanceHelper.syncToPlayer(player1, player2, options)
+	local manager1 = SmoothDanceHelper.getManager(player1)
+	if not manager1 then return false end
+
+	local syncOptions = options or {}
+	syncOptions.fadeIn = syncOptions.fadeIn or 0.2
+	syncOptions.fadeOut = syncOptions.fadeOut or 0.3
+	syncOptions.syncMode = true
+
+	local manager2 = SmoothDanceHelper.getManager(player2)
+	if manager2 then
+		local info2 = manager2:getCurrentInfo()
+		if info2.isPlaying then
+			return manager1:playDance(info2.name, {
+				speed = info2.speed,
+				syncTime = info2.timePosition,
+				fadeIn = syncOptions.fadeIn,
+				fadeOut = syncOptions.fadeOut,
+				syncMode = true
+			})
+		end
+	else
+		local userId2 = player2.UserId
+		if fallbackStates[userId2] and fallbackStates[userId2].track then
+			local state2 = fallbackStates[userId2]
+			if state2.track.IsPlaying then
+				return SmoothDanceHelper.playDance(player1, state2.name, {
+					speed = state2.speed,
+					fadeIn = syncOptions.fadeIn,
+					fadeOut = syncOptions.fadeOut
+				})
+			end
+		end
+	end
+	return false
+end
+
+function SmoothDanceHelper.test(player)
+
+	local targetPlayer = player or Players.LocalPlayer
+	local currentInfo = SmoothDanceHelper.getCurrentInfo(targetPlayer)
+
+	local testResult = SmoothDanceHelper.playDance(targetPlayer, "Fresh", { speed = 1 })
+
+end
+
+local function initializeAllPlayers()
+	for _, player in pairs(Players:GetPlayers()) do
+		if player.Character then
+			SmoothDanceHelper.initializePlayer(player)
+		end
+	end
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function()
+		task.wait(1)
+		SmoothDanceHelper.initializePlayer(player)
+		SmoothDanceHelper.preloadPopularAnimations(player, {
+			"Fresh", "Floss", "Gangnam style", "New Dance 01", "New Dance 02"
+		})
+	end)
+
+	if player.Character then
+		task.spawn(function()
+			task.wait(1)
+			SmoothDanceHelper.initializePlayer(player)
+		end)
+	end
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	SmoothDanceHelper.cleanupPlayer(player)
+end)
+
+task.spawn(function()
+	task.wait(2)
+	initializeAllPlayers()
+end)
+
+SmoothDanceHelper.playDanceWithAnimationObject = SmoothDanceHelper.playDance
+SmoothDanceHelper.stopAllDances = SmoothDanceHelper.stopAll
+
+function SmoothDanceHelper.getAllManagers()
+	return managers
+end
+
+
+return SmoothDanceHelper
