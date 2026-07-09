@@ -1,0 +1,153 @@
+--SyncManager--Moudul
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local LocalPlayer = Players.LocalPlayer
+local EmoteConfig = require(ReplicatedStorage:WaitForChild("SetModule"):WaitForChild("EmoteConfig"))
+
+-- [FIX JALUR NOTIFIKASI] Ambil dari PlayerScripts (Runtime), bukan StarterPlayerScripts
+local PlayerScripts = LocalPlayer:WaitForChild("PlayerScripts")
+local NotifHelper = require(PlayerScripts:WaitForChild("ClientSystemSoftware"):WaitForChild("ClientModules"):WaitForChild("NotificationHelper"))
+
+-- Deklarasi utama SyncManager harus ada di atas sebelum fungsinya dipanggil!
+local SyncManager = {}
+local syncRemote = nil
+local stopSyncRemote = nil
+local SmoothDanceHelper = nil
+
+local success, result = pcall(function()
+	return require(ReplicatedStorage.SetModule.SyncModules.SmoothDanceHelper)
+end)
+
+local hasSmoothDance = success and result ~= nil
+if success then SmoothDanceHelper = result end
+
+local Config = {
+	PREPARATION_DELAY = 0.5,
+	ESTABLISHMENT_WAIT = 1,
+	STOP_CONFIRMATION = 0.4,
+	NOTIFICATION_DURATION = 3
+}
+
+function SyncManager:Initialize()
+	local SyncRemoteFolder = ReplicatedStorage.SetModule:FindFirstChild("SyncRemote")
+	if SyncRemoteFolder then
+		syncRemote = SyncRemoteFolder:FindFirstChild("Sync")
+		stopSyncRemote = SyncRemoteFolder:FindFirstChild("StopSync")
+	end
+end
+
+function SyncManager:IsTargetDancing(target)
+	if not target.Character then return false, 0 end
+	local humanoid = target.Character:FindFirstChild("Humanoid") or target.Character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return false, 0 end
+	local animator = humanoid:FindFirstChild("Animator") or humanoid:FindFirstChildOfClass("Animator")
+	if not animator then return false, 0 end
+
+	local playingTracks = animator:GetPlayingAnimationTracks()
+	local danceCount = 0
+	local activeDances = {}
+
+	for _, track in pairs(playingTracks) do
+		if track.Animation and track.IsPlaying then
+			local animId = track.Animation.AnimationId
+			local animNumber = tonumber(string.match(animId, "(%d+)"))
+
+			if animNumber then
+				local isFound = false
+				local danceName = "Unknown"
+
+				if EmoteConfig.Dances then
+					for _, data in ipairs(EmoteConfig.Dances) do
+						if data[2] == animNumber then isFound = true; danceName = data[1]; break end
+					end
+				end
+
+				if not isFound and EmoteConfig.Emotes then
+					for _, data in ipairs(EmoteConfig.Emotes) do
+						if data[2] == animNumber then isFound = true; danceName = data[1]; break end
+					end
+				end
+
+				if isFound then
+					danceCount = danceCount + 1
+					table.insert(activeDances, { name = danceName, speed = track.Speed, timePosition = track.TimePosition })
+				end
+			end
+		end
+	end
+	return danceCount > 0, danceCount, activeDances
+end
+
+function SyncManager:StartSync(target)
+	if not target then return end
+	if not syncRemote then return end
+
+	local isDancing, danceCount, activeDances = self:IsTargetDancing(target)
+
+	task.spawn(function()
+		if hasSmoothDance and SmoothDanceHelper then
+			SmoothDanceHelper.stopDance(LocalPlayer, 0.3)
+			task.wait(Config.PREPARATION_DELAY)
+		else
+			task.wait(Config.PREPARATION_DELAY)
+		end
+
+		syncRemote:FireServer(target)
+		task.wait(Config.ESTABLISHMENT_WAIT)
+
+		if self:IsTargetDancing(target) then
+			-- [PERBAIKAN]: Cek apakah ini Leader Transfer
+			if LocalPlayer:GetAttribute("IsLeaderTransfer") then
+				-- Hapus atribut agar kembali normal untuk sync berikutnya
+				LocalPlayer:SetAttribute("IsLeaderTransfer", nil)
+				-- Client tidak memunculkan notif standar; Server yang akan mengirimkannya
+			else
+				NotifHelper.Notify("Sistem Tarian", "Anda sekarang menari selaras dengan " .. target.DisplayName, 3)
+			end
+		end
+	end)
+end
+
+function SyncManager:StopSync()
+	if not stopSyncRemote then return end
+
+	stopSyncRemote:FireServer()
+
+	task.spawn(function()
+		task.wait(Config.STOP_CONFIRMATION)
+		if hasSmoothDance and SmoothDanceHelper and SmoothDanceHelper.getCurrentInfo(LocalPlayer).isPlaying then
+			SmoothDanceHelper.stopDance(LocalPlayer, 0.2)
+		end
+
+		_G.IsSyncingDance = false
+		NotifHelper.Notify("Sistem Tarian", "Sinkronisasi tarian telah dihentikan", 3)
+	end)
+end
+
+function SyncManager:GetSyncStatus()
+	if not _G.GetSimpleSyncStatus then
+		return { isFollowing = false, target = "None", hasAnimation = false, hasLocalAnimation = false, localAnimationName = nil }
+	end
+
+	local status = _G.GetSimpleSyncStatus()
+	if hasSmoothDance and status.isFollowing then
+		local localInfo = SmoothDanceHelper.getCurrentInfo(LocalPlayer)
+		status.hasLocalAnimation = localInfo.isPlaying
+		status.localAnimationName = localInfo.name
+	end
+	return status
+end
+
+local function ForceStopSyncAllMethodsEnhanced()
+	if SyncManager and SyncManager.StopSync then pcall(function() SyncManager:StopSync() end) end
+	if hasSmoothDance and SmoothDanceHelper then pcall(function() SmoothDanceHelper.stopDance(LocalPlayer, 0.6) end) end
+	if stopSyncRemote then pcall(function() stopSyncRemote:FireServer() end) end
+	_G.IsSyncingDance = false
+end
+
+_G.ForceStopSyncAllMethodsEnhanced = ForceStopSyncAllMethodsEnhanced
+_G.EnhancedStopSync = ForceStopSyncAllMethodsEnhanced
+
+return SyncManager
