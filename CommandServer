@@ -1,0 +1,46 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+
+local AppearanceHandler = require(script.Parent.AppearanceHandler)
+
+local remotedCmd = ReplicatedStorage:WaitForChild("SetModule"):WaitForChild("KonfigurasiSystemSoftware"):WaitForChild("RemotedCmd")
+local commandEvent = remotedCmd:WaitForChild("CommandEvent")
+local serverCommandEvent = remotedCmd:FindFirstChild("ServerCommandEvent")
+
+if not serverCommandEvent then
+	serverCommandEvent = Instance.new("BindableEvent")
+	serverCommandEvent.Name = "ServerCommandEvent"
+	serverCommandEvent.Parent = remotedCmd
+end
+
+-- ============================================================
+-- LOGIKA UTAMA (Sentralisasi)
+-- ============================================================
+local function executeCommand(player, action)
+	if action == "refresh" then
+		AppearanceHandler.reload(player)
+	elseif action == "rejoin" then
+		if RunService:IsStudio() then
+			player:Kick("Rejoin tidak tersedia di Roblox Studio.")
+		else
+			pcall(function()
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, player)
+			end)
+		end
+	end
+end
+
+-- ============================================================
+-- SINGLE FLOW ENTRY POINT (Baik UI maupun Chat masuk ke sini)
+-- ============================================================
+commandEvent.OnServerEvent:Connect(function(player, action)
+	executeCommand(player, action)
+end)
+
+serverCommandEvent.Event:Connect(function(player, action)
+	if player and typeof(player) == "Instance" and player:IsA("Player") then
+		executeCommand(player, action)
+	end
+end)
